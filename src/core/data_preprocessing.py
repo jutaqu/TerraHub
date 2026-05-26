@@ -1,94 +1,57 @@
 """
-Data Preprocessing - Focal & Transfer Ready
+Data Preprocessing - Better Health Labeling for Monstera
 """
-
-from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
 
-from .utils import load_plant_care_profiles, print_feature_summary, set_seed
 
+def preprocess_data(target_plant="Monstera Deliciosa"):
+    print("\n=== Starting Data Preprocessing ===")
 
-def derive_health_labels(
-    df: pd.DataFrame, profiles: Dict, target_plant: Optional[str] = None
-) -> pd.DataFrame:
-    print("Deriving health status labels using probabilistic logic...")
-    df = df.copy()
+    df = pd.read_csv("data/raw/plant_health_data.csv")
+    print(f"✓ Loaded {len(df)} sensor readings from data/raw/plant_health_data.csv")
 
-    for plant_name, profile in profiles.items():
-        if target_plant is not None and plant_name != target_plant:
-            continue
+    if "Timestamp" in df.columns:
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"])
+        df = df.sort_values(["Plant_ID", "Timestamp"]).reset_index(drop=True)
 
-        mask = (
-            df["plant_name"] == plant_name
-            if target_plant is None
-            else pd.Series(True, index=df.index)
-        )
-        if not mask.any():
-            continue
+    print(f"✓ Forced all data to focal plant: {target_plant}")
 
-        subset = df[mask].copy()
+    df = derive_health_status(df, target_plant)
 
-        moisture = subset.get("soil_moisture", pd.Series([25.0] * len(subset)))
-        light = subset.get("light_lux", pd.Series([600.0] * len(subset)))
-        vpd = subset.get("vpd", pd.Series([1.2] * len(subset)))
-
-        moisture_opt = profile.get("soil_moisture", {"min": 20, "max": 40})
-        light_opt = profile.get("light_lux", {"min": 400, "max": 800})
-
-        moisture_dev = abs(
-            moisture - (moisture_opt["min"] + moisture_opt["max"]) / 2
-        ) / (moisture_opt["max"] - moisture_opt["min"] + 1e-8)
-
-        light_dev = abs(light - (light_opt["min"] + light_opt["max"]) / 2) / (
-            light_opt["max"] - light_opt["min"] + 1e-8
-        )
-
-        vpd_dev = abs(vpd - 1.2)
-
-        stress_score = 0.45 * moisture_dev + 0.30 * light_dev + 0.25 * vpd_dev
-
-        labels = []
-        for score in stress_score:
-            rand = np.random.random()
-            if score < 0.7:
-                label = "Healthy" if rand < 0.88 else "Moderate Stress"
-            elif score < 1.5:
-                label = (
-                    "Moderate Stress"
-                    if rand < 0.70
-                    else ("Healthy" if rand < 0.92 else "High Stress")
-                )
-            else:
-                label = "High Stress" if rand < 0.82 else "Moderate Stress"
-            labels.append(label)
-
-        df.loc[mask, "health_status"] = labels
-
-    print(f"✓ Labels applied. Distribution:\n{df['health_status'].value_counts()}")
+    print(f"✓ Labels applied. Distribution:\n{df['health_status'].value_counts()}\n")
     return df
 
 
-def preprocess_data(target_plant: Optional[str] = None) -> pd.DataFrame:
-    print("=== Starting Data Preprocessing ===\n")
-    set_seed(42)
+def derive_health_status(df, target_plant="Monstera Deliciosa"):
+    """Simple, effective 3-class labeling based on key sensors"""
+    df = df.copy()
 
-    df = pd.read_csv("data/raw/plant_health_data.csv")
-    print(f"✓ Loaded {len(df)} sensor readings.")
+    # Simple composite stress score using main TerraHub sensors
+    df["stress_score"] = (
+        (df["Soil_Moisture"] - 0.55).abs() * 2.0  # Optimal ~0.55
+        + (df["Ambient_Temperature"] - 24).abs() * 0.8  # Optimal ~24°C
+        + (df["Humidity"] - 70).abs() * 0.6  # Optimal ~70%
+        + (df["Soil_pH"] - 6.0).abs() * 3.0  # Optimal ~6.0
+        + (df["Light_Intensity"] - 12000).abs() * 0.00008  # Optimal ~12000 lux
+    )
 
-    profiles = load_plant_care_profiles()
+    # Normalize and assign classes
+    max_score = df["stress_score"].quantile(0.95)  # Robust to outliers
+    df["normalized_stress"] = df["stress_score"] / max_score
 
-    plant_list = list(profiles.keys())
-    if plant_list:
-        if target_plant:
-            df["plant_name"] = target_plant
-            print(f"✓ Forced all data to focal plant: {target_plant}")
+    def assign_class(score):
+        if score <= 0.35:
+            return "Healthy"
+        elif score <= 0.70:
+            return "Moderate Stress"
         else:
-            df["plant_name"] = [plant_list[i % len(plant_list)] for i in range(len(df))]
-            print(f"✓ Assigned {len(plant_list)} plant types (General mode)")
+            return "High Stress"
 
-    df = derive_health_labels(df, profiles, target_plant)
-    print_feature_summary(df)
-    print("✅ Preprocessing completed!\n")
+    df["health_status"] = df["normalized_stress"].apply(assign_class)
+
+    print(f"✓ Simple 3-class labeling completed. Distribution:")
+    print(df["health_status"].value_counts())
+
     return df

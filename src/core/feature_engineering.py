@@ -1,24 +1,18 @@
 """
-Feature Engineering with Importance Support
+Feature Engineering - Core Sensors + Valuable Temporal Features
 """
-
-from typing import Dict
 
 import numpy as np
 import pandas as pd
 
 
-def calculate_vpd(temperature: float, humidity: float) -> float:
-    svp = 0.6108 * np.exp((17.27 * temperature) / (temperature + 237.3))
-    return svp * (1 - humidity / 100)
-
-
-def engineer_features(df: pd.DataFrame, profiles: Dict) -> pd.DataFrame:
-    print("\n=== Starting Core Feature Engineering ===\n")
-
+def engineer_features(df: pd.DataFrame):
     df = df.copy()
 
-    col_map = {
+    print("\n=== Starting Core Feature Engineering ===")
+
+    # Standardize column names
+    rename_map = {
         "Soil_Moisture": "soil_moisture",
         "Ambient_Temperature": "air_temp",
         "Soil_Temperature": "soil_temp",
@@ -27,30 +21,55 @@ def engineer_features(df: pd.DataFrame, profiles: Dict) -> pd.DataFrame:
         "Soil_pH": "soil_ph",
         "Electrochemical_Signal": "ec",
     }
-    df = df.rename(columns=col_map)
 
-    core_cols = [
+    for old, new in rename_map.items():
+        if old in df.columns:
+            df[new] = df[old]
+
+    core_sensors = [
         "soil_moisture",
-        "soil_temp",
         "air_temp",
+        "soil_temp",
         "humidity",
         "light_lux",
         "soil_ph",
         "ec",
     ]
+    core_sensors = [col for col in core_sensors if col in df.columns]
 
-    if "air_temp" in df.columns and "humidity" in df.columns:
-        df["vpd"] = df.apply(
-            lambda row: calculate_vpd(row["air_temp"], row["humidity"]), axis=1
+    print(f"Core Sensors: {core_sensors}")
+
+    # === Valuable Temporal Features ===
+    for col in core_sensors:
+        # Rolling mean (trend)
+        df[f"{col}_roll_mean_5"] = df[col].rolling(window=5, min_periods=1).mean()
+
+        # Rolling volatility
+        df[f"{col}_roll_std_5"] = (
+            df[col].rolling(window=5, min_periods=1).std().fillna(0)
         )
-        print("✓ Added VPD feature")
 
-    available_core = [col for col in core_cols if col in df.columns]
-    keep_cols = available_core + ["vpd", "plant_name", "health_status"]
-    keep_cols = [col for col in keep_cols if col in df.columns]
+        # Rate of change (most important for plant stress)
+        df[f"{col}_delta"] = df[col].diff().fillna(0)
 
-    df = df[keep_cols].copy()
+    # High-value interactions
+    if "humidity" in df.columns and "air_temp" in df.columns:
+        df["humidity_temp_interaction"] = df["humidity"] * df["air_temp"]
 
-    print(f"Final columns: {keep_cols}")
-    print("✅ Core feature engineering completed!\n")
+    if "soil_moisture" in df.columns and "soil_temp" in df.columns:
+        df["moisture_temp_ratio"] = df["soil_moisture"] / (df["soil_temp"] + 1)
+
+    # Final column selection
+    keep_cols = (
+        core_sensors
+        + [f"{col}_roll_mean_5" for col in core_sensors]
+        + [f"{col}_delta" for col in core_sensors]
+        + ["humidity_temp_interaction", "moisture_temp_ratio", "health_status"]
+    )
+
+    df = df[keep_cols]
+
+    print(f"Final columns ({len(df.columns)}): {df.columns.tolist()}")
+    print("✅ Feature engineering completed!\n")
+
     return df
