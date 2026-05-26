@@ -1,156 +1,169 @@
-"""
-Focal 1D-CNN Training - Fixed Evaluation
-"""
-
 import os
 import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import os
 from collections import Counter
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
-from core.config import TrainingConfig
-from core.data_loader import PlantHealthDataset
-from core.data_preprocessing import preprocess_data
-from core.feature_engineering import engineer_features
-from core.model import PlantHealthCNN
-from core.utils import ensure_dir, set_seed
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 
-def evaluate_model(model, loader, description=""):
-    model.eval()
-    all_preds = []
-    all_labels = []
+class FocalLoss(nn.Module):
+    """Stronger Focal Loss - Heavy penalty for missing Healthy"""
 
-    with torch.no_grad():
-        for x, _, y in loader:
-            outputs = model(x)
-            _, predicted = outputs.max(1)
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(y.cpu().numpy())
+    def __init__(self, alpha=[8.0, 1.0, 1.0], gamma=4.0):
+        super().__init__()
+        self.alpha = torch.tensor(alpha, dtype=torch.float32).to(device)
+        self.gamma = gamma
+        self.ce = nn.CrossEntropyLoss(reduction="none")
 
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    val_acc = (all_preds == all_labels).mean() * 100
+    def forward(self, inputs, targets):
+        ce_loss = self.ce(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha[targets] * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
 
-    print(
-        f"\n  {description} → Val Acc: {val_acc:.2f}% | Predictions: {Counter(all_preds)}"
-    )
 
-    # Safe classification report
-    from sklearn.metrics import classification_report
+class PlantHealthCNN(nn.Module):
+    def __init__(self, input_size=7, num_classes=3):
+        super().__init__()
+        self.conv1 = nn.Conv1d(input_size, 64, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.conv3 = nn.Conv1d(128, 64, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.pool = nn.MaxPool1d(2)
+        self.dropout = nn.Dropout(0.4)
+        self.fc1 = nn.Linear(64, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, num_classes)
+        self.relu = nn.ReLU()
 
-    unique_labels = np.unique(all_labels)
-    target_names = ["Healthy", "Moderate Stress", "High Stress"]
-
-    print(
-        classification_report(
-            all_labels,
-            all_preds,
-            labels=unique_labels,
-            target_names=[target_names[i] for i in unique_labels],
-            zero_division=0,
-        )
-    )
-    return val_acc
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.pool(x)
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x)
+        x = self.relu(self.bn3(self.conv3(x)))
+        x = x.mean(dim=2)
+        x = self.dropout(self.relu(self.fc1(x)))
+        x = self.dropout(self.relu(self.fc2(x)))
+        x = self.fc3(x)
+        return x
 
 
 def train_focal_species():
-    ensure_dir("models")
-    ensure_dir("runs")
+    print("\n=== Training 1D-CNN on Monstera Deliciosa ===")
 
-    config = TrainingConfig(
-        focal_plants=["Monstera Deliciosa"],
-        num_epochs=180,
-        learning_rate=0.0003,
-        weight_decay=8e-4,
-        patience=40,
-    )
+    from core.data_loader import PlantHealthDataset
+    from core.data_preprocessing import preprocess_data
+    from core.feature_engineering import engineer_features
 
-    set_seed(config.random_seed)
-    config.print_config()
-
-    df = preprocess_data(target_plant=config.focal_plants[0])
+    df = preprocess_data(target_plant="Monstera Deliciosa")
     df = engineer_features(df)
 
-    if "plant_name" in df.columns or "Plant_ID" in df.columns:
-        df = df.drop(
-            columns=[col for col in ["plant_name", "Plant_ID"] if col in df.columns]
-        )
+    # Chronological split
+    split_idx = int(0.80 * len(df))
+    df_train = df.iloc[:split_idx].copy().reset_index(drop=True)
+    df_holdout = df.iloc[split_idx:].copy().reset_index(drop=True)
 
-    print(f"=== Training 1D-CNN on {config.focal_plants[0]} ===\n")
-
-    train_df, val_df = train_test_split(
-        df,
-        test_size=0.25,
-        random_state=config.random_seed,
-        stratify=df["health_status"],
+    print(
+        f"✓ Chronological split → Train: {len(df_train)} rows | Holdout (unseen): {len(df_holdout)} rows"
     )
 
-    train_dataset = PlantHealthDataset(train_df, sequence_length=config.sequence_length)
-    val_dataset = PlantHealthDataset(val_df, sequence_length=config.sequence_length)
+    # Stronger oversampling for Healthy
+    healthy_mask = df_train["health_status"] == "Healthy"
+    if healthy_mask.sum() > 0:
+        df_healthy = df_train[healthy_mask].sample(n=600, replace=True, random_state=42)
+        df_train = pd.concat([df_train, df_healthy], ignore_index=True)
+        print(
+            f"✓ Oversampled Healthy class in training set → {df_train['health_status'].value_counts().get('Healthy', 0)} samples"
+        )
+
+    feature_cols = [
+        "soil_moisture",
+        "soil_temp",
+        "air_temp",
+        "humidity",
+        "light_lux",
+        "soil_ph",
+        "ec",
+    ]
+
+    train_dataset = PlantHealthDataset(
+        df_train, feature_cols=feature_cols, sequence_length=20
+    )
+    val_dataset = PlantHealthDataset(
+        df_holdout, feature_cols=feature_cols, sequence_length=20
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
-    model = PlantHealthCNN(input_size=len(train_dataset.feature_cols), num_classes=3)
-
-    criterion = nn.CrossEntropyLoss(
-        weight=torch.tensor([2.0, 1.0, 5.0], dtype=torch.float32)
-    )
-    optimizer = optim.AdamW(
-        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
-    )
+    model = PlantHealthCNN(input_size=len(feature_cols)).to(device)
+    criterion = FocalLoss(alpha=[8.0, 1.0, 1.0], gamma=4.0)  # Stronger focus
+    optimizer = optim.AdamW(model.parameters(), lr=0.00025, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.4, patience=12
+        optimizer, mode="max", patience=25, factor=0.5
     )
 
-    best_val_acc = 0.0
-    epochs_no_improve = 0
+    best_acc = 0.0
+    patience = 70
+    counter = 0
 
-    print("Starting 1D-CNN training...\n")
-
-    for epoch in range(config.num_epochs):
+    for epoch in range(180):
         model.train()
-        correct = total = 0
         for x, _, y in train_loader:
+            x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             outputs = model(x)
             loss = criterion(outputs, y)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            _, predicted = outputs.max(1)
-            total += y.size(0)
-            correct += predicted.eq(y).sum().item()
+        model.eval()
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for x, _, y in val_loader:
+                x = x.to(device)
+                outputs = model(x)
+                preds = outputs.argmax(1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(y.numpy())
 
-        train_acc = 100.0 * correct / total
-        val_acc = evaluate_model(model, val_loader, f"Epoch {epoch + 1:3d}")
-
+        val_acc = 100 * np.mean(np.array(all_preds) == np.array(all_labels))
         scheduler.step(val_acc)
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        print(
+            f"  Epoch {epoch + 1:3d} → Val Acc: {val_acc:.2f}% | Predictions: {Counter(all_preds)}"
+        )
+
+        if val_acc > best_acc:
+            best_acc = val_acc
             torch.save(model.state_dict(), "models/best_focal_monstera_cnn.pth")
-            epochs_no_improve = 0
+            counter = 0
         else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= config.patience:
-                print(f"  → Early stopping triggered.")
+            counter += 1
+            if counter >= patience:
+                print("  → Early stopping triggered.")
                 break
 
-    print(f"\n✅ Training completed! Best Val Acc: {best_val_acc:.2f}%")
-    torch.save(model.state_dict(), "models/final_focal_cnn.pth")
+    print(f"\n✅ Training completed! Best Val Acc on Unseen Holdout: {best_acc:.2f}%")
     print("✅ Final 1D-CNN model saved.")
 
 
 if __name__ == "__main__":
+    os.makedirs("models", exist_ok=True)
     train_focal_species()

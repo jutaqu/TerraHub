@@ -1,58 +1,50 @@
-"""
-PlantHealthDataset - Clean Sensor-Only Mode
-"""
-
+import numpy as np
 import pandas as pd
 import torch
-from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import Dataset
 
 
 class PlantHealthDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, sequence_length: int = 20):
+    def __init__(self, df, feature_cols=None, sequence_length=20):
         self.sequence_length = sequence_length
 
-        # Core sensor features only
-        self.feature_cols = [
-            "soil_moisture",
-            "soil_temp",
-            "air_temp",
-            "humidity",
-            "light_lux",
-            "soil_ph",
-            "ec",
-            "vpd",
-        ]
-
-        # Keep only features that actually exist
-        self.feature_cols = [col for col in self.feature_cols if col in df.columns]
+        if feature_cols is None:
+            # Auto-detect numeric sensor columns
+            exclude = ["health_status", "plant_name", "Timestamp", "Plant_ID"]
+            self.feature_cols = [
+                col
+                for col in df.columns
+                if col not in exclude and pd.api.types.is_numeric_dtype(df[col])
+            ]
+        else:
+            self.feature_cols = [col for col in feature_cols if col in df.columns]
 
         print(f"Using features: {self.feature_cols}")
 
-        self.scaler = MinMaxScaler()
-        self.features = self.scaler.fit_transform(df[self.feature_cols])
-
-        # Labels
-        label_map = {"Healthy": 0, "Moderate Stress": 1, "High Stress": 2}
-        self.labels = df["health_status"].map(label_map).values
+        self.X = df[self.feature_cols].values.astype(np.float32)
+        self.y = pd.Categorical(df["health_status"]).codes
 
         # Create sequences
         self.sequences = []
-        self.seq_labels = []
+        self.labels = []
 
-        for i in range(len(self.features) - sequence_length + 1):
-            self.sequences.append(self.features[i : i + sequence_length])
-            self.seq_labels.append(self.labels[i + sequence_length - 1])
+        for i in range(len(self.X) - sequence_length + 1):
+            seq = self.X[i : i + sequence_length]
+            label = self.y[i + sequence_length - 1]  # label at end of sequence
+            self.sequences.append(seq)
+            self.labels.append(label)
 
-        print(f"Created {len(self.sequences)} sequences of length {sequence_length}\n")
+        self.sequences = np.array(self.sequences)
+        self.labels = np.array(self.labels)
+
+        print(f"Created {len(self.sequences)} sequences of length {sequence_length}")
 
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        x = torch.tensor(self.sequences[idx], dtype=torch.float32)
-        y = torch.tensor(self.seq_labels[idx], dtype=torch.long)
-
-        # Return dummy plant_id (ignored in sensor-only mode)
-        plant_id = torch.tensor(0, dtype=torch.long)
-        return x, plant_id, y
+        return (
+            torch.tensor(self.sequences[idx], dtype=torch.float32),
+            0,  # dummy plant_id (no embedding)
+            torch.tensor(self.labels[idx], dtype=torch.long),
+        )
