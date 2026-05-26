@@ -1,5 +1,5 @@
 """
-General Pipeline - Multi-Plant Training
+General Pipeline - Clean & Minimal Version (Closest to Previous ~65% Run)
 """
 
 import os
@@ -32,15 +32,15 @@ def main():
         learning_rate=0.001,
         weight_decay=1e-5,
         embedding_dim=12,
-        patience=6,
+        patience=12,
         model_save_name="best_general_model.pth",
     )
 
     set_seed(config.random_seed)
     config.print_config()
 
-    # General mode: target_plant=None
-    df = preprocess_data(target_plant=None)
+    # Data
+    df = preprocess_data(target_plant=None)  # General mode
     profiles = load_plant_care_profiles()
     df = engineer_features(df, profiles)
 
@@ -56,16 +56,19 @@ def main():
     train_dataset = PlantHealthDataset(train_df, sequence_length=config.sequence_length)
     val_dataset = PlantHealthDataset(val_df, sequence_length=config.sequence_length)
 
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
+    # Class weights
     class_counts = Counter(train_df["health_status"])
     weights = [
         1.0 / class_counts.get(c, 1)
         for c in ["Healthy", "Moderate Stress", "High Stress"]
     ]
     class_weights = torch.tensor(weights, dtype=torch.float32)
+    print(f"Class weights: {class_weights.numpy()}")
 
+    # Model
     model = PlantHealthSimple(
         input_size=len(train_dataset.feature_cols),
         num_plants=len(profiles),
@@ -79,9 +82,12 @@ def main():
     )
 
     best_val_acc = 0.0
-    print("Starting General Model Training...\n")
+    epochs_no_improve = 0
+
+    print("Starting training...\n")
 
     for epoch in range(config.num_epochs):
+        # Train
         model.train()
         correct = 0
         total = 0
@@ -98,6 +104,7 @@ def main():
 
         train_acc = 100.0 * correct / total
 
+        # Validate
         model.eval()
         val_correct = 0
         val_total = 0
@@ -114,11 +121,21 @@ def main():
             f"Epoch {epoch + 1:2d} | Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%"
         )
 
+        # Early Stopping
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), f"models/{config.model_save_name}")
+            epochs_no_improve = 0
+            print(f"  → New best model saved ({val_acc:.2f}%)")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= config.patience:
+                print(f"  → Early stopping triggered.")
+                break
 
-    print(f"\n✅ General Training completed! Best Val Acc: {best_val_acc:.2f}%")
+    print(
+        f"\n✅ General Training completed! Best Validation Accuracy: {best_val_acc:.2f}%"
+    )
     torch.save(model.state_dict(), "models/final_general_model.pth")
 
 
